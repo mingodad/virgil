@@ -60,7 +60,9 @@ class SsaContext(compiler: Compiler, prog: Program) {
 	def filter(f: VstMatcher) -> bool {
 		return method != null && f.matches(method.source);
 	}
-	def newBuilder() -> SsaBuilder {
-		return SsaBuilder.new(this, graph, SsaBlock.new());
+	def newBuilder(source: Source) -> SsaBuilder {
+		var b = SsaBuilder.new(this, graph, SsaBlock.new());
+		b.source = source;
+		return b;
 	}
 }
