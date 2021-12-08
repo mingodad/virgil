@@ -3,10 +3,12 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // Normalizes a program based on the results of reachability analysis.
+def TRANSFERRABLE_FACTS = (Fact.M_ABSTRACT | Fact.M_INLINE | Fact.M_OPERATOR | Fact.M_NEW | Fact.M_EMPTY | Fact.M_EQUALS);
 class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 	def liveClasses = Vector<RaClass>.new();
 	def context = SsaContext.new(ra.compiler, ra.prog);
 	def fields = Vector<IrField>.new();
+	def typeMap = TypeUtil.newTypeMap<TypeNorm>();
 	var recordMap = V3.newRecordMap<Record>(); // XXX: canonicalize equivalent variant records
 	var complexRecordMap = V3.newRecordMap<Array<Record>>();
 	var newIr = IrModule.new();
@@ -15,8 +17,8 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 	var ovfAlloc: OverflowFieldAllocator;  // OVF where to allocate the fields?
 
 	def normalize() {
-		// layout fields into classes
 		if (Aeneas.PRINT_DEAD_CODE.get()) DeadCodeAnalyzer.new(ra).report();
+		// layout fields into classes
 		ra.arrays.apply(visitArrayType);
 		ra.classes.apply(visitClassType);
 		if (ra.compiler.PartialSpecialization) {
@@ -42,12 +44,13 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 	}
 	def visitClassType(rc: RaClass) {
 		layoutClass(rc);
+		var tn = norm(rc.oldType);
 		if (V3.isComponent(rc.oldType)) {
 			var comp = V3.componentDecl(rc.oldType), newRecord: Record;
 			if (rc.instances != null) {
 				// normalize component record
 				var oldRecord = rc.instances.head;
-				newRecord = ra.prog.newRecord(rc.newType, rc.normFields.length);
+				newRecord = ra.prog.newRecord(tn.newType, rc.normFields.length);
 				complexRecordMap[oldRecord] = NO_RECORDS;
 				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord));
 			}
@@ -55,27 +58,42 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		} else {
 			// create and map new records to be normalized
 			for (l = rc.instances; l != null; l = l.tail) {
-				var oldRecord = l.head, newRecord = ra.prog.newRecord(rc.newType, rc.normFields.length);
+				var oldRecord = l.head, newRecord = ra.prog.newRecord(tn.newType, rc.normFields.length);
 				recordMap[l.head] = newRecord;
 				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord));
 			}
 		}
+		for (ml in rc.methods) {
+			// Create IrMethods for all methods that didn't have norm signatures
+			for (l = ml; l != null; l = l.tail) {
+				var rm = l.head, m = rm.orig;
+				if (rm.norm == null) {
+					var ftype = FuncNorm.!(norm(if(rm.spec == null, m.sig.funcType(), rm.spec.getMethodType())));
+					var ft = Function.CLOSURE.create(ftype.sub[0].nested); // correct the typecon; norm() returns FUNCREF type
+					var typeParams = if(rm.spec != null, rm.spec.getTypes().methodTypeArgs);
+					rm.norm = IrMethod.new(rc.oldType, typeParams, FuncType.!(ft).sig());
+				}
+				rm.norm.facts = m.facts & TRANSFERRABLE_FACTS;
+				rm.norm.source = m.source;
+			}
+		}
 	}
 	def visitArrayType(rt: RaArray) {
-		if (rt.oldType != rt.newType) {
-			if (rt.enorm != null) {
+		var tn = ArrayNorm.!(norm(rt.oldType));
+		if (tn.oldType != tn.newType) {
+			if (tn.enorm != null) {
 				// normalize elements of mixed arrays
 				for (l = rt.instances; l != null; l = l.tail) {
-					var newRecord = ra.prog.newRecord(rt.newType, l.head.values.length);
+					var newRecord = ra.prog.newRecord(tn.newType, l.head.values.length);
 					recordMap[l.head] = newRecord;
-					ra.queue.add(normMixedArrayRecord, (rt, l.head, newRecord));
+					ra.queue.add(normMixedArrayRecord, (tn, l.head, newRecord));
 				}
 			} else {
 				// map complex arrays to arrays of records
-				var ta = Tuple.toTypeArray(rt.newType);
+				var ta = Tuple.toTypeArray(tn.newType);
 				for (l = rt.instances; l != null; l = l.tail) {
-					var newRecords = createComplexArrayRecord(l.head, ta, rt);
-					ra.queue.add(normComplexArrayRecord, (rt, l.head, newRecords));
+					var newRecords = createComplexArrayRecord(l.head, ta, tn);
+					ra.queue.add(normComplexArrayRecord, (tn, l.head, newRecords));
 				}
 			}
 		} else if (!rt.primitive) {
@@ -84,6 +102,69 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 				ra.queue.add(normSimpleArrayRecord, l.head);
 			}
 		}
+	}
+	def norm(t: Type) -> TypeNorm {
+		if (t.open()) return V3.fail1("is open %q", t.render);
+		var tn = typeMap[t];
+		if (tn != null) return tn;
+		// not in the hashmap, build appropriately
+		match (t.typeCon.kind) {
+			V3Kind.VOID => {
+				tn = TypeNorm.new(t, Void.TYPE, TypeUtil.NO_TYPES);
+			}
+			V3Kind.COMPONENT => {
+				tn = TypeNorm.new(t, Void.TYPE, TypeUtil.NO_TYPES);
+			}
+			V3Kind.ARRAY => {
+				var at: ArrayNorm;
+				var enorm = norm(V3Array.elementType(t));
+				if (enorm.size == 0) {
+					tn = at = ArrayNorm.new(t, V3.voidArrayType, null);
+				} else if (enorm.sub == null) {
+					tn = at = ArrayNorm.new(t, V3Array.newType(enorm.newType), null);
+				} else if (ra.compiler.MixedArrays) {
+					tn = at = ArrayNorm.new(t, V3Array.newType(enorm.newType), null);
+					at.enorm = enorm;
+				} else {
+					var et = Arrays.map(enorm.sub, V3Array.newType);
+					tn = at = ArrayNorm.new(t, Tuple.newType(Lists.fromArray(et)), et);
+				}
+			}
+			V3Kind.CLOSURE => {
+				// translate closure into (funcref, object) pair
+				var pt = limit(norm(Function.getParamType(t)), ra.compiler.MaxParams-1);
+				var rt = limit(norm(Function.getReturnType(t)), ra.compiler.MaxReturnValues);
+				var ft = Function.FUNCREF.create(Lists.cons2(pt.0, rt.0));
+				var ta = [ft, AnyObject.TYPE];
+				tn = FuncNorm.new(t, Tuple.newType(Lists.fromArray(ta)), pt.1, rt.1, ta);
+			}
+			V3Kind.TUPLE => {
+				// flatten tuples
+				var vecT = Vector<Type>.new();
+				var vecO = Vector<int>.new();
+				var vecN = Vector<TypeNorm>.new();
+				for (p = t.nested; p != null; p = p.tail) {
+					var n = norm(p.head);
+					vecO.put(vecT.length);
+					vecN.put(n);
+					n.addTo(vecT);
+				}
+				var ta = vecT.extract();
+				tn = TupleNorm.new(t, Tuple.newType(Lists.fromArray(ta)), ta, vecN.extract(), vecO.extract());
+			}
+			_ => {
+				tn = TypeNorm.new(t, t, null);
+			}
+		}
+		typeMap[t] = tn;
+		return tn;
+	}
+	def limit(tn: TypeNorm, len: int) -> (Type, Array<Type>) {
+//		XXX.put3("limit %q %q |%d|\n", tn.oldType.render, tn.newType.render, len);
+		if (tn.size <= len) return (tn.newType, TypeUtil.NO_TYPES);
+		if (tn.sub == null) return (Void.TYPE, [tn.newType]);
+		var t = Tuple.fromTypeArray(Arrays.range(tn.sub, 0, len));
+		return (t, Arrays.range(tn.sub, len, tn.sub.length));
 	}
 	// lay out a classes' fields and number it according to liveness
 	def layoutClass(rc: RaClass) {
@@ -131,7 +212,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		}
 	}
 	// map a complex array to an array of records
-	def createComplexArrayRecord(r: Record, types: Array<Type>, rt: RaArray) -> Array<Record> {
+	def createComplexArrayRecord(r: Record, types: Array<Type>, rt: ArrayNorm) -> Array<Record> {
 		var complex = Array<Record>.new(rt.size);
 		for (i < complex.length) {
 			complex[i] = ra.prog.newRecord(types[i], r.values.length);
@@ -152,6 +233,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 				continue;
 			}
 			if (rf.isConst()) continue;
+			if (rf.typeNorm == null && rf.fieldType != null) rf.typeNorm = norm(rf.fieldType);
 			if (!rf.raFacts.RF_READ) continue;
 			// add normalized field(s)
 			rf.normIndex = fields.length;
@@ -170,11 +252,12 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 			rf.norm = [IrSpec.new(rc.oldType, [rc.oldType], rf.orig)];
 		} else {
 			// add normalized field(s) to the vector
-			var norms = Array<IrSpec>.new(rf.fieldType.size);
-			var facts = if(rf.fieldType.size > 1, Fact.F_NORM, Facts.NONE);
+			var tn = rf.typeNorm;
+			var norms = Array<IrSpec>.new(tn.size);
+			var facts = if(tn.size > 1, Fact.F_NORM, Facts.NONE);
 			if (!rf.raFacts.RF_WRITTEN) facts |= (Fact.F_VALUE | Fact.O_FOLDABLE);
 			for (i < norms.length) {
-				var ft = if(rf.fieldType.sub == null, rf.fieldType.newType, rf.fieldType.sub[i]);
+				var ft = if(tn.sub == null, tn.newType, tn.sub[i]);
 				var nf = IrField.new(rc.oldType, ft);
 				nf.setFact(facts);
 				nf.source = rf.orig.source;
@@ -192,7 +275,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 			if (rf != null && rf.normIndex >= 0) {
 				var v = oldRecord.values[i];
 				if (rf.fieldType == null) newRecord.values[rf.normIndex] = normSimpleVal(v);
-				else normValIntoArray(v, rf.fieldType, newRecord.values, rf.normIndex);
+				else normValIntoArray(v, rf.typeNorm, newRecord.values, rf.normIndex);
 			}
 		}
 	}
@@ -202,13 +285,13 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		for (i < v.length) v[i] = normSimpleVal(v[i]);
 	}
 	// normalize the live instances of a mixed array type
-	def normMixedArrayRecord(rt: RaArray, oldRecord: Record, newRecord: Record) {
+	def normMixedArrayRecord(rt: ArrayNorm, oldRecord: Record, newRecord: Record) {
 		def v = oldRecord.values;
 		for (i < v.length) newRecord.values[i] = normAsTupleVal(v[i], rt.enorm);
 	}
 	// normalize the live instances of a complex (i.e. size-N element) array type
-	def normComplexArrayRecord(rt: RaArray, oldRecord: Record, newRecords: Array<Record>) {
-		var etn = ra.makeType(V3Array.elementType(rt.oldType));
+	def normComplexArrayRecord(rt: ArrayNorm, oldRecord: Record, newRecords: Array<Record>) {
+		var etn = norm(V3Array.elementType(rt.oldType));
 		var old = oldRecord.values;
 		var temp = Array<Val>.new(newRecords.length);
 		for (i < old.length) {
@@ -273,7 +356,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 			// constructors always end up at slot 0
 			rm.norm.facts |= Fact.M_NEW;
 			vtable[0] = rm.norm;
-			rm.norm.index = 0;
+			rm.norm.index = rm.normIndex = 0;
 			return;
 		}
 		var sm = resolveMethodImpl(rc.parent, rm);
@@ -337,7 +420,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 			}
 			x: TupleVal => {
 				// tuple: recursively normalize all of the sub
-				var tnn = RaTuple.!(tn).nested;
+				var tnn = TupleNorm.!(tn).nested;
 				for (i < tnn.length) {
 					normValIntoArray(x.values[i], tnn[i], array, index);
 					index = index + tnn[i].size;
@@ -382,7 +465,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		SsaRaNormalizer.new(context, this).build(rm.norm);
 		newIr.methods.put(rm.norm);
 	}
-	def allocOverflowFields(ftype: RaFuncType) {
+	def allocOverflowFields(ftype: FuncNorm) {
 		if (ftype.ovfParamFields != null) return;
 		if (ovfAlloc == null) {
 			var prog = context.prog;

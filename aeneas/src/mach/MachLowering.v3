@@ -402,7 +402,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			dest[index] = v;
 			return;
 		}
-		if (RaIntType.?(tn)) {
+		if (IntNorm.?(tn)) {
 			if (Box<int>.?(v)) mach.intNorm.normIntIntoArray(IntType.!(tn.oldType), Box<int>.!(v).val, dest, index);
 			if (Box<long>.?(v)) mach.intNorm.normLongIntoArray(IntType.!(tn.oldType), Box<long>.!(v).val, dest, index);
 		}
@@ -418,7 +418,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 	}
 
-	def normTypeTuple(t: Type) -> RaTuple {
+	def normTypeTuple(t: Type) -> TupleNorm {
 		// TODO: cache flattened tuples which occur in returns
 		// flatten tuples
 		var vecT = Vector<Type>.new();
@@ -432,9 +432,9 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			else n.addTo(vecT);
 		}
 		var ta = vecT.extract();
-		return RaTuple.new(t, Tuple.newType(Lists.fromArray(ta)), ta, vecN.extract(), vecO.extract());
+		return TupleNorm.new(t, Tuple.newType(Lists.fromArray(ta)), ta, vecN.extract(), vecO.extract());
 	}
-	def normIntType(t: Type) -> RaIntType {
+	def normIntType(t: Type) -> IntNorm {
 		return mach.intNorm.normType(t);
 	}
 	def genApplyOp(oi: SsaApplyOp) {
@@ -592,7 +592,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var newArgs = normRefs(oi.inputs);
 		return genIntCmpRec(oi, tn, newArgs, tn.bigEndIndex(), infixH, infixL);
 	}
-	def genIntCmpRec(oi: SsaApplyOp, tn: RaIntType, newArgs: Array<SsaInstr>, i: int, infixH: IntType -> Operator, infixL: IntType -> Operator) -> SsaInstr {
+	def genIntCmpRec(oi: SsaApplyOp, tn: IntNorm, newArgs: Array<SsaInstr>, i: int, infixH: IntType -> Operator, infixL: IntType -> Operator) -> SsaInstr {
 		var a = newArgs[i], b = newArgs[i + tn.size];
 		var tt = IntType.!(tn.sub[i]);
 		if (i == tn.littleEndIndex()) {
@@ -739,7 +739,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var ni = apply(oi.source, V3Op.newIntWide(op, tn.sub, tn.newType), inputs);
 		return mapWide(oi, ni, tn, trunc);
 	}
-	def getWordShiftCount(inputs: Array<SsaInstr>, tt: IntType, tn: RaIntType) -> int {
+	def getWordShiftCount(inputs: Array<SsaInstr>, tt: IntType, tn: IntNorm) -> int {
 		for (i = tn.size + 1; i < inputs.length; i++) {
 			if (!SsaConst.?(inputs[i]) || inputs[i].unbox<int>() != 0) return -1;
 		}
@@ -1243,7 +1243,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		if (TypeSystem.isIntPromotable(ft, tt)) return x;
 		return curBlock.opIntViewI0(ft, tt, x);
 	}
-	def mapWide(oi: SsaApplyOp, ni: SsaInstr, tn: RaIntType, truncate: bool) {
+	def mapWide(oi: SsaApplyOp, ni: SsaInstr, tn: IntNorm, truncate: bool) {
 		if (tn == null) return map1(oi, ni);
 		var vals = Array<SsaInstr>.new(tn.sub.length);
 		for (i < tn.size) vals[i] = apply(oi.source, V3Op.newTupleGetElem(tn.newType, i), [ni]);
@@ -1591,7 +1591,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		oi.remove();
 	}
 	def genTupleGetElem(oi: SsaApplyOp, index: int) {
-		var tn = RaTuple.!(normType(oi.op.typeArgs[0]));
+		var tn = TupleNorm.!(normType(oi.op.typeArgs[0]));
 		mapN(oi, tn.getElem(normRefs(oi.inputs), index));
 	}
 	def genNullCheck(oi: SsaApplyOp) -> SsaInstr {
