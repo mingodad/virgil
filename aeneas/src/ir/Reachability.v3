@@ -535,6 +535,9 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	def makeClass(t: Type) -> RaClass {
 		return RaClass.!(makeType(t));
 	}
+	def getClass(t: Type) -> RaClass {
+		return RaClass.!(typeMap[t]);
+	}
 	def makeType(t: Type) -> RaType {
 		if (t.open()) return V3.fail1("is open %q", t.render);
 		var raType = typeMap[t];
@@ -606,6 +609,7 @@ class RaItem {
 class RaType(oldType: Type) {
 	var raFacts: RaFact.set;
 	var recursive: int;			// 0 if unknown, < 0 if on stack, 1 if not recursive, > 1 if recursive
+	def isRecursive() -> bool { return recursive > 1; }
 }
 // Tracks whether a class is allocated, collects instances, and tracks information
 // about fields and methods.
@@ -622,6 +626,7 @@ class RaClass extends RaType {
 	var normMethods: Array<IrMethod>;	// normalized methods
 	var minClassId = -1;			// minimum class ID
 	var maxClassId = -1;			// maximum class ID
+	var tupleNorm: TupleNorm;		// non-null for flattened variants
 
 	new(oldType: Type, orig, parent) super(oldType) {
 		if (parent != null) {

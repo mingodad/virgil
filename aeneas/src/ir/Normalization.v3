@@ -43,7 +43,17 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		if (ovfAlloc != null) allocOverflowFieldRecord();
 	}
 	def visitClassType(rc: RaClass) {
-		layoutClass(rc);
+		if (rc.minClassId < 0) {
+			var ic = rc;
+			while (ic.parent != null) ic = ic.parent; // start at root
+
+			if (V3.isVariant(ic.oldType)) {
+				if (ic.children == null) layoutDataType(ic);
+				else layoutVariant(ic);
+			} else {
+				layoutClass(ic);
+			}
+		}
 		var tn = norm(rc.oldType);
 		if (V3.isComponent(rc.oldType)) {
 			var comp = V3.componentDecl(rc.oldType), newRecord: Record;
@@ -152,6 +162,11 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 				var ta = vecT.extract();
 				tn = TupleNorm.new(t, Tuple.newType(Lists.fromArray(ta)), ta, vecN.extract(), vecO.extract());
 			}
+			V3Kind.VARIANT => {
+				var rc = ra.getClass(t);
+				if (rc != null && rc.tupleNorm != null) tn = rc.tupleNorm;
+				else tn = TypeNorm.new(t, t, null);
+			}
 			_ => {
 				tn = TypeNorm.new(t, t, null);
 			}
@@ -166,50 +181,75 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		var t = Tuple.fromTypeArray(Arrays.range(tn.sub, 0, len));
 		return (t, Arrays.range(tn.sub, len, tn.sub.length));
 	}
-	// lay out a classes' fields and number it according to liveness
-	def layoutClass(rc: RaClass) {
-		if (rc.minClassId >= 0) return; // already processed this type
-		while (rc.parent != null) rc = rc.parent; // start at root
-		numberClass(rc);
-	}
 	// number a class and lay out its fields, recursively visiting children
-	def numberClass(rc: RaClass) {
+	def layoutClass(rc: RaClass) {
+//		XXX.put1("layoutClass %q\n", rc.oldType.render);
 		rc.minClassId = liveClasses.length;
-		if (V3.isVariant(rc.oldType)) return numberVariantClass(rc);
 		if (live(rc.raFacts) && !V3.isComponent(rc.oldType)) {
 			liveClasses.put(rc);
 		}
 		layoutFields(rc);
-		for (l = rc.children; l != null; l = l.tail) numberClass(l.head);
+		for (l = rc.children; l != null; l = l.tail) layoutClass(l.head);
 		rc.maxClassId = liveClasses.length;
 	}
-	def numberVariantClass(rc: RaClass) {
+	// number a variant and children consistent with tagging order
+	def layoutVariant(rc: RaClass) {
+//		Terminal.put1("layoutVariant %q\n", rc.oldType.render);
+		rc.minClassId = liveClasses.length;
 		layoutFields(rc);
-		// number variant classes consistently with their tagging order.
 		var isEnum = rc.normFields.length == 0;
-		if (rc.children == null) {
-			// XXX: cleaner way to detect data type classes
-			rc.minClassId = liveClasses.length;
-			liveClasses.put(rc);
-		} else {
-			for (l = rc.children; l != null; l = l.tail) {
-				var c = l.head;
-				layoutFields(c);
-				var index = rc.minClassId + V3.getVariantTag(c.oldType);
-				c.minClassId = index;
-				c.maxClassId = index + 1;
-				liveClasses.grow(index + 1);
-				if (liveClasses.length < c.maxClassId) liveClasses.length = index + 1;
-				liveClasses[index] = c;
-				if (c.normFields.length > 0) isEnum = false;
-			}
+		for (l = rc.children; l != null; l = l.tail) {
+			var c = l.head;
+			layoutFields(c);
+			var index = rc.minClassId + V3.getVariantTag(c.oldType);
+			c.minClassId = index;
+			c.maxClassId = index + 1;
+			liveClasses.grow(index + 1);
+			if (liveClasses.length < c.maxClassId) liveClasses.length = index + 1;
+			liveClasses[index] = c;
+			if (c.normFields.length > 0) isEnum = false;
 		}
 		rc.maxClassId = liveClasses.length;
-		if (isEnum) {
-			// this and all children classes will be represented as enums
-			rc.raFacts |= RaFact.RC_ENUM;
-			for (l = rc.children; l != null; l = l.tail) l.head.raFacts |= RaFact.RC_ENUM;
+		if (isEnum) markEnum(rc);
+	}
+	// number and lay out a data type, which may be flattened
+	def layoutDataType(rc: RaClass) {
+//		XXX.put1("layoutDataType %q\n", rc.oldType.render);
+		rc.minClassId = liveClasses.length;
+		liveClasses.put(rc);
+		layoutFields(rc);
+//		XXX.put2(" %d fields, recursive = %d\n", rc.normFields.length, rc.recursive);
+		if (rc.normFields.length <= ra.compiler.MaxFlatDataValues && rc.recursive <= 1 && !rc.raFacts.RC_CLOSURE) {
+			// small enough and not recursive or closed over, flatten into scalars
+			var vecT = Vector<Type>.new();
+			var vecO = Vector<int>.new();
+			var vecN = Vector<TypeNorm>.new();
+			for (rf in rc.fields) {
+				if (rf.normIndex < 0) continue;
+				var tn: TypeNorm;
+				if (rf.fieldType != null) {
+					vecT.put(rf.fieldType);
+					tn = rf.typeNorm;
+				} else {
+					vecT.put(rf.orig.fieldType);
+					tn = norm(rf.orig.fieldType);
+				}
+				vecO.put(vecT.length);
+				vecN.put(tn);
+			}
+			var ta = vecT.extract();
+			rc.tupleNorm = TupleNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(ta)), ta, vecN.extract(), vecO.extract());
+//			XXX.put2("flattened %q to %q\n", rc.oldType.render, rc.tupleNorm.newType.render);
+		} else if (rc.normFields.length == 0) {
+			markEnum(rc);
 		}
+		rc.maxClassId = liveClasses.length;
+
+	}
+	def markEnum(rc: RaClass) {
+		// this and all children classes will be represented as enums
+		rc.raFacts |= RaFact.RC_ENUM;
+		for (l = rc.children; l != null; l = l.tail) l.head.raFacts |= RaFact.RC_ENUM;
 	}
 	// map a complex array to an array of records
 	def createComplexArrayRecord(r: Record, types: Array<Type>, rt: ArrayNorm) -> Array<Record> {
