@@ -100,10 +100,9 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 				}
 			} else {
 				// map complex arrays to arrays of records
-				var ta = Tuple.toTypeArray(tn.newType);
 				for (l = rt.instances; l != null; l = l.tail) {
-					var newRecords = createComplexArrayRecord(l.head, ta, tn);
-					ra.queue.add(normComplexArrayRecord, (tn, l.head, newRecords));
+					var newRecords = createComplexArrayRecord(l.head, rt);
+					ra.queue.add(normComplexArrayRecord, (rt, l.head, newRecords));
 				}
 			}
 		} else if (!rt.primitive) {
@@ -252,14 +251,21 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		for (l = rc.children; l != null; l = l.tail) l.head.raFacts |= RaFact.RC_ENUM;
 	}
 	// map a complex array to an array of records
-	def createComplexArrayRecord(r: Record, types: Array<Type>, rt: ArrayNorm) -> Array<Record> {
-		var complex = Array<Record>.new(rt.size);
-		for (i < complex.length) {
-			complex[i] = ra.prog.newRecord(types[i], r.values.length);
+	def createComplexArrayRecord(r: Record, rt: RaArray) -> Array<Record> {
+		var sub = rt.sub;
+		if (sub == null) {
+			var result = ra.prog.newRecord(rt.newType, r.values.length);
+			recordMap[r] = result;
+			return [result];
+		} else {
+			var complex = Array<Record>.new(sub.length);
+			for (i < complex.length) {
+				complex[i] = ra.prog.newRecord(sub[i], r.values.length);
+			}
+			if (complex.length == 1) recordMap[r] = complex[0];
+			complexRecordMap[r] = complex;
+			return complex;
 		}
-		if (complex.length == 1) recordMap[r] = complex[0];
-		complexRecordMap[r] = complex;
-		return complex;
 	}
 	// layout fields for classes and components
 	def layoutFields(rc: RaClass) {
