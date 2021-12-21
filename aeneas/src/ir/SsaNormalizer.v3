@@ -16,6 +16,42 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	def genGraph() -> SsaGraph {
 		if (newGraph != null) return newGraph;
+
+		// Normalize old parameters into new parameters
+		var oldParams = context.graph.params;
+		var newParams = Vector<SsaParam>.new().grow(oldParams.length);
+		var newRanges = Vector<(int,  int)>.new().grow(oldParams.length);
+		var funcType = normFuncType(context.method.sig.funcType());
+		for (i < oldParams.length) {
+			var oldParam = oldParams[i];
+			var tn = normType(oldParam.vtype);
+			var start = newParams.length;
+			if (tn == null) {
+				// type already normalized
+				newParams.put(SsaParam.new(newParams.length, oldParam.vtype));
+			} else if (tn.size == 1) {
+				// simple normalization
+				newParams.put(SsaParam.new(newParams.length, tn.newType));
+			} else if (i == 0 && tn.size == 0) {
+				// first param became void, e.g. component receiver
+				newParams.put(SsaParam.new(newParams.length, tn.newType));
+				start++; // skip this param to force a 1 -> 0 mapping
+			} else {
+				// allocate multiple parameters
+				for (j < tn.sub.length) {
+					newParams.put(SsaParam.new(newParams.length, tn.sub[j]));
+				}
+			}
+			newRanges.put(start, newParams.length);
+		}
+		// Allocate new values for mapping the old params
+		var newValues = Array<SsaInstr>.new(newParams.length);
+		for (i < newParams.length) newValues[i] = newParams[i];
+
+		// Create a new graph, respecting overflow params and returns
+		var ovfP = funcType.ovfParamTypes.length;
+		var maxP = newParams.length - ovfP;
+		newParams.length = maxP;
 		var rt = context.graph.returnType;
 		var tn = normType(rt);
 		if (tn != null) {
@@ -26,40 +62,28 @@ class SsaRaNormalizer extends SsaRebuilder {
 				rt = tn.newType;
 			}
 		}
+		newGraph = SsaGraph.new(newParams.extract(), rt);
 
-		// translate parameters and allocate new graph
-		var params = Vector<SsaParam>.new().grow(context.graph.params.length);
-		// Allocate parameters
-		for (p in context.graph.params) {
-			allocParam(p, params);
-		}
-		// Handle overflow parameters if necessary
-		var maxP = context.compiler.MaxParams, newParams: Array<SsaInstr>;
-		if (params.length > maxP) {
-			newGraph = SsaGraph.new(Arrays.range(params.array, 0, maxP), rt);
-			var ftype = normFuncType(context.method.sig.funcType());
-			newParams = Array<SsaInstr>.new(params.length);
-			for (i < maxP) newParams[i] = params[i];
-			var ovfP = params.length - maxP;
+		if (ovfP > 0) {
+			// Handle overflow parameters by inserting loads+casts in the first block
 			var b = SsaBuilder.new(context, newGraph, newGraph.startBlock);
-			var nullConst = newGraph.nullConst(ftype.ovfParamFields[0].receiver);
-			for (i = 0; i < ovfP; i++) {
-				var load = b.opGetField(ftype.ovfParamFields[i], nullConst);
-				var cast = b.opTypeSubsume(ftype.ovfParamFields[i].getFieldType(), ftype.ovfParamTypes[i], load);
-				newParams[i + maxP] = cast;
+			var nullConst = newGraph.nullConst(funcType.ovfParamFields[0].receiver);
+			for (i < ovfP) {
+				var load = b.opGetField(funcType.ovfParamFields[i], nullConst);
+				var cast = b.opTypeSubsume(funcType.ovfParamFields[i].getFieldType(), funcType.ovfParamTypes[i], load);
+				newValues[i + maxP] = cast;
 			}
-		} else {
-			var pa = params.extract();
-			newGraph = SsaGraph.new(pa, rt);
-			newParams = Array<SsaInstr>.new(pa.length);
-			for (i < pa.length) newParams[i] = pa[i];
-		}
-		// Map parameters
-		var i = 0;
-		for (p in context.graph.params) {
-			i += mapParam(i, p, newParams);
 		}
 
+		// Map old parameters to new parameters
+		for (i < newRanges.length) {
+			var t = newRanges[i], size = t.1 - t.0;
+			if (size == 0) map0(oldParams[i]);
+			else if (size == 1) map1(oldParams[i], newValues[t.0]);
+			else mapN(oldParams[i], Arrays.range(newValues, t.0, t.1));
+		}
+
+		// Visit and generate new normalized code
 		var oldStart = context.graph.startBlock;
 		if (oldStart.succs().length == 0) {
 			// common case of a single block that ends in return or throw
@@ -72,28 +96,10 @@ class SsaRaNormalizer extends SsaRebuilder {
 		instrMap.clear();
 		return newGraph;
 	}
-	def allocParam(oldParam: SsaParam, params: Vector<SsaParam>) {
-		var tn = normType(oldParam.vtype);
-		if (tn == null) {
-			// type already normalized
-			params.put(SsaParam.new(params.length, oldParam.vtype));
-		} else if (params.length == 0 || tn.size == 1) {
-			// first param or simple normalization
-			params.put(SsaParam.new(params.length, tn.newType));
-		} else {
-			// allocate multiple parameters
-			for (t in tn.sub) params.put(SsaParam.new(params.length, t));
-		}
-	}
-	def mapParam(pos: int, oldParam: SsaParam, newParams: Array<SsaInstr>) -> int {
-		var tn = normType(oldParam.vtype);
-		if (tn == null || tn.size == 1) {
-			map1(oldParam, newParams[pos]);
-			return 1;
-		}
-		var vals = Arrays.range(newParams, pos, pos + tn.size);
-		mapN(oldParam, vals);
-		return if(pos == 0, 1, tn.size);
+	def mapParam1(params: Vector<SsaParam>, oldParam: SsaParam, t: Type) {
+		var np = SsaParam.new(params.length, t);
+		params.put(np);
+		map1(oldParam, np);
 	}
 	def genSimpleVal(v: Val) -> Val {
 		return norm.normSimpleVal(v);
@@ -127,6 +133,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 		curBlock.at(app.source);
 		var orig = app.op, op = app.op, args = app.inputs;
 		if (context.spec != null) op = app.op.subst(context.spec.instantiateType);
+		// XXX: are extractMethodRef() substitutions redundant because of above?
 		match (op.opcode) {
 			OverloadedEq =>		normEqualOp(app, op);
 			IntQueryI => {
@@ -152,6 +159,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 			}
 			BoolEq,
 			IntEq,
+			// TODO(flat): reference equal of flattened data type
 			RefEq =>		normSimpleEqualOp(app, op);
 			VariantEq =>		normVariantEqualOp(app, op);
 			IntViewI =>		normIntViewI(app, op);
@@ -163,8 +171,11 @@ class SsaRaNormalizer extends SsaRebuilder {
 			ArrayGetElem =>		normArrayGetElem(app, op);
 			ArraySetElem =>		normArraySetElem(app, op);
 			ArrayGetLength =>	normArrayGetLength(app, op);
+			// TODO(flat): class alloc => subsequence select
 			ClassAlloc(method) =>	normClassAlloc(app, method, op);
+			// TODO(flat): class get field => subsequence select
 			ClassGetField(field) =>	normGetField(false, app, field, op);
+			// TODO(flat): class init field => nop
 			ClassInitField(field) =>normClassSetField(app, field, op, true);
 			ClassSetField(field) =>	normClassSetField(app, field, op, false);
 			ClassGetMethod(method) => {
@@ -259,12 +270,16 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var newOp = V3Op.newCallMethod(m);
 		// for variant calls, replace null receiver with record
 		if (V3.isVariant(m.receiver)) {
+			var rc = norm.ra.getClass(m.receiver);
 			var newArgs = normArgs(ftype, genRefs(oldInstr.inputs));
-			var obj = newArgs[0];
-			if (!obj.facts.V_NON_ZERO) {
-				newArgs[0] = curBlock.add(V3Op.newVariantReplaceNull(m.receiver), [obj], Facts.NONE);
-				norm.newIr.makeIrClass(m.receiver).facts |= Fact.C_HEAP;
+			if (!rc.raFacts.RC_FLAT) {
+				var obj = newArgs[0];
+				if (!obj.facts.V_NON_ZERO) {
+					newArgs[0] = curBlock.add(V3Op.newVariantReplaceNull(m.receiver), [obj], Facts.NONE);
+					norm.newIr.makeIrClass(m.receiver).facts |= Fact.C_HEAP;
+				}
 			}
+			if (rc.dataNorm != null && rc.dataNorm.size == 0) newArgs = Arrays.prepend(newGraph.nullReceiver(), newArgs); // TODO: hack for 0-width data norm
 			var i = normCallWithArgs(oldInstr, ftype, newOp, newArgs);
 			i.setFact(Fact.O_NO_NULL_CHECK);
 		} else {
@@ -619,6 +634,16 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 	}
 	def normClassAlloc(oldApp: SsaApplyOp, m: IrMethod, op: Operator) {
+		var rc = norm.ra.getClass(op.typeArgs[0]);
+		var dn = rc.dataNorm;
+		if (dn != null) {
+			var inputs = genRefs(oldApp.inputs);
+			var result = Vector<SsaInstr>.new().grow(dn.size);
+			for (t in dn.origRanges) {
+				for (i = t.0; i < t.1; i++) result.put(inputs[i]);
+			}
+			return mapN(oldApp, result.extract());
+		}
 		if (m == null) {
 			// trivial constructor
 			var spec = IrSpec.new(op.typeArgs[0], op.typeArgs, null);
@@ -626,21 +651,22 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 		var t = extractMethodRef(oldApp.op, m);
 		var ftype = normFuncType(t.0.getBoundType());
-		var newArgs = normArgs(ftype, genRefs(oldApp.inputs));
+		var ninputs = genRefs(oldApp.inputs);
+		var newArgs = normArgs(ftype, ninputs);
 		return map1(oldApp, curBlock.opClassAlloc(t.1, newArgs));
 	}
 	def normGetField(isVariant: bool, oldApp: SsaApplyOp, field: IrField, op: Operator) {
 		// XXX: propagate O_NO_NULL_CHECK and O_PURE
-		var receiver = genRef1(oldApp.inputs[0]);
+		var ninputs = genRefs(oldApp.inputs);
 		if (oldApp.useList == null) {
 			// OPT: remove unused read of field
-			if (!isVariant) addNullCheck(oldApp, receiver);
+			if (!isVariant) addNullCheck(oldApp, ninputs[0]);
 			return;
 		}
 		var raField = extractFieldRef(oldApp, field);
 		if (raField.isConst()) {
 			// OPT: inline the field as a constant
-			if (!isVariant) addNullCheck(oldApp, receiver);
+			if (!isVariant) addNullCheck(oldApp, ninputs[0]);
 			mapValue(oldApp, raField.val, normReturnType(oldApp.op));
 			return;
 		}
@@ -648,9 +674,22 @@ class SsaRaNormalizer extends SsaRebuilder {
 		if (nf.length == 0) {
 			// OPT: remove read of useless field
 			// OPT: remove read of zero-width field
-			if (!isVariant) addNullCheck(oldApp, receiver);
+			if (!isVariant) addNullCheck(oldApp, ninputs[0]);
 			return map0(oldApp);
-		} else if (nf.length == 1) {
+		}
+		if (raField.raFacts.RC_FLAT) {
+			// field of flattened data type
+			normType(raField.receiver); // XXX: normType() side-effect of flattening
+			var rc = norm.ra.getClass(raField.receiver);
+			var vals = Array<SsaInstr>.new(nf.length);
+			var start = rc.dataNorm.normRanges[raField.orig.index].0;
+			for (i < vals.length) {
+				vals[i] = ninputs[start + i];
+			}
+			return mapN(oldApp, vals);
+		}
+		var receiver = ninputs[0];
+		if (nf.length == 1) {
 			// common case 1-1 mapping
 			var read = curBlock.opGetField(raField.norm[0], receiver);
 			read.facts = read.facts | raField.facts(); // OPT: propagate field facts
@@ -673,6 +712,9 @@ class SsaRaNormalizer extends SsaRebuilder {
 			// OPT: remove write of zero-width field
 			// OPT: remove write of write-only field
 			return addNullCheck(oldApp, receiver);
+		} else if (raField.raFacts.RC_FLAT) {
+			// init/set of field of flattened data type
+			return map0(oldApp);
 		} else if (nf.length == 1) {
 			// common case; 1-1 field mapping
 			curBlock.opClassSetField(nf[0], receiver, newArgs[1], init);
