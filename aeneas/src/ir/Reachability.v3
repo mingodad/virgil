@@ -16,7 +16,8 @@ enum RaFact {
 	RC_EQUALITY,
 	RC_VARIANT,
 	RC_ENUM,
-	RC_CLOSURE
+	RC_CLOSURE,
+	RC_FLAT
 }
 
 def DUMP: Terminal;
@@ -151,6 +152,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		if (facts.RC_VARIANT) DUMP.put(" variant");
 		if (facts.RC_EQUALITY) DUMP.put(" equal");
 		if (facts.RC_CLOSURE) DUMP.put(" closure");
+		if (facts.RC_FLAT) DUMP.put(" flat");
 		if (countVals(facts) == 1) {
 			DUMP.put1(" const[%s]", V3.renderVal(val));
 		}
@@ -364,6 +366,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			ClassInitField(field) => initField(op, makeField(op, field, context));
 			ClassSetField(field) => setField(op, makeField(op, field, context));
 			ComponentSetField(field) => setField(op, makeField(op, field, context));
+			// TODO(flat): disable flattening for PtrAtObjectField
 			PtrAtObjectField(field) => if (op.useList != null) getAndSetField(makeField(op, field, context));
 			PtrAtComponentField(field) => if (op.useList != null) getAndSetField(makeField(op, field, context));
 			_ => ;
@@ -626,7 +629,7 @@ class RaClass extends RaType {
 	var normMethods: Array<IrMethod>;	// normalized methods
 	var minClassId = -1;			// minimum class ID
 	var maxClassId = -1;			// maximum class ID
-	var tupleNorm: TupleNorm;		// non-null for flattened variants
+	var dataNorm: DataNorm;			// non-null for flattened variants
 
 	new(oldType: Type, orig, parent) super(oldType) {
 		if (parent != null) {

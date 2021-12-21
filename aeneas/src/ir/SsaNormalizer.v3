@@ -77,8 +77,11 @@ class SsaRaNormalizer extends SsaRebuilder {
 		if (tn == null) {
 			// type already normalized
 			params.put(SsaParam.new(params.length, oldParam.vtype));
-		} else if (params.length == 0 || tn.size == 1) {
-			// first param or simple normalization
+		} else if (tn.size == 1) {
+			// simple normalization
+			params.put(SsaParam.new(params.length, tn.newType));
+		} else if (params.length == 0 && tn.size == 0) {
+			// first param became void, e.g. component receiver
 			params.put(SsaParam.new(params.length, tn.newType));
 		} else {
 			// allocate multiple parameters
@@ -127,6 +130,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 		curBlock.at(app.source);
 		var orig = app.op, op = app.op, args = app.inputs;
 		if (context.spec != null) op = app.op.subst(context.spec.instantiateType);
+		// XXX: are extractMethodRef() substitutions redundant because of above?
 		match (op.opcode) {
 			OverloadedEq =>		normEqualOp(app, op);
 			IntQueryI => {
@@ -152,6 +156,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 			}
 			BoolEq,
 			IntEq,
+			// TODO(flat): reference equal of flattened data type
 			RefEq =>		normSimpleEqualOp(app, op);
 			VariantEq =>		normVariantEqualOp(app, op);
 			IntViewI =>		normIntViewI(app, op);
@@ -163,8 +168,11 @@ class SsaRaNormalizer extends SsaRebuilder {
 			ArrayGetElem =>		normArrayGetElem(app, op);
 			ArraySetElem =>		normArraySetElem(app, op);
 			ArrayGetLength =>	normArrayGetLength(app, op);
+			// TODO(flat): class alloc => subsequence select
 			ClassAlloc(method) =>	normClassAlloc(app, method, op);
+			// TODO(flat): class get field => subsequence select
 			ClassGetField(field) =>	normGetField(false, app, field, op);
+			// TODO(flat): class init field => nop
 			ClassInitField(field) =>normClassSetField(app, field, op, true);
 			ClassSetField(field) =>	normClassSetField(app, field, op, false);
 			ClassGetMethod(method) => {
@@ -259,11 +267,14 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var newOp = V3Op.newCallMethod(m);
 		// for variant calls, replace null receiver with record
 		if (V3.isVariant(m.receiver)) {
+			var rc = norm.ra.getClass(m.receiver);
 			var newArgs = normArgs(ftype, genRefs(oldInstr.inputs));
-			var obj = newArgs[0];
-			if (!obj.facts.V_NON_ZERO) {
-				newArgs[0] = curBlock.add(V3Op.newVariantReplaceNull(m.receiver), [obj], Facts.NONE);
-				norm.newIr.makeIrClass(m.receiver).facts |= Fact.C_HEAP;
+			if (!rc.raFacts.RC_FLAT) {
+				var obj = newArgs[0];
+				if (!obj.facts.V_NON_ZERO) {
+					newArgs[0] = curBlock.add(V3Op.newVariantReplaceNull(m.receiver), [obj], Facts.NONE);
+					norm.newIr.makeIrClass(m.receiver).facts |= Fact.C_HEAP;
+				}
 			}
 			var i = normCallWithArgs(oldInstr, ftype, newOp, newArgs);
 			i.setFact(Fact.O_NO_NULL_CHECK);
@@ -619,6 +630,16 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 	}
 	def normClassAlloc(oldApp: SsaApplyOp, m: IrMethod, op: Operator) {
+		var rc = norm.ra.getClass(op.typeArgs[0]);
+		var dn = rc.dataNorm;
+		if (dn != null) {
+			var inputs = genRefs(oldApp.inputs);
+			var result = Vector<SsaInstr>.new().grow(dn.size);
+			for (t in dn.origRanges) {
+				for (i = t.0; i < t.1; i++) result.put(inputs[i]);
+			}
+			return mapN(oldApp, result.extract());
+		}
 		if (m == null) {
 			// trivial constructor
 			var spec = IrSpec.new(op.typeArgs[0], op.typeArgs, null);
@@ -626,21 +647,22 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 		var t = extractMethodRef(oldApp.op, m);
 		var ftype = normFuncType(t.0.getBoundType());
-		var newArgs = normArgs(ftype, genRefs(oldApp.inputs));
+		var ninputs = genRefs(oldApp.inputs);
+		var newArgs = normArgs(ftype, ninputs);
 		return map1(oldApp, curBlock.opClassAlloc(t.1, newArgs));
 	}
 	def normGetField(isVariant: bool, oldApp: SsaApplyOp, field: IrField, op: Operator) {
 		// XXX: propagate O_NO_NULL_CHECK and O_PURE
-		var receiver = genRef1(oldApp.inputs[0]);
+		var ninputs = genRefs(oldApp.inputs);
 		if (oldApp.useList == null) {
 			// OPT: remove unused read of field
-			if (!isVariant) addNullCheck(oldApp, receiver);
+			if (!isVariant) addNullCheck(oldApp, ninputs[0]);
 			return;
 		}
 		var raField = extractFieldRef(oldApp, field);
 		if (raField.isConst()) {
 			// OPT: inline the field as a constant
-			if (!isVariant) addNullCheck(oldApp, receiver);
+			if (!isVariant) addNullCheck(oldApp, ninputs[0]);
 			mapValue(oldApp, raField.val, normReturnType(oldApp.op));
 			return;
 		}
@@ -648,9 +670,22 @@ class SsaRaNormalizer extends SsaRebuilder {
 		if (nf.length == 0) {
 			// OPT: remove read of useless field
 			// OPT: remove read of zero-width field
-			if (!isVariant) addNullCheck(oldApp, receiver);
+			if (!isVariant) addNullCheck(oldApp, ninputs[0]);
 			return map0(oldApp);
-		} else if (nf.length == 1) {
+		}
+		if (raField.raFacts.RC_FLAT) {
+			// field of flattened data type
+			normType(raField.receiver); // XXX: normType() side-effect of flattening
+			var rc = norm.ra.getClass(raField.receiver);
+			var vals = Array<SsaInstr>.new(nf.length);
+			var start = rc.dataNorm.normRanges[raField.orig.index].0;
+			for (i < vals.length) {
+				vals[i] = ninputs[start + i];
+			}
+			return mapN(oldApp, vals);
+		}
+		var receiver = ninputs[0];
+		if (nf.length == 1) {
 			// common case 1-1 mapping
 			var read = curBlock.opGetField(raField.norm[0], receiver);
 			read.facts = read.facts | raField.facts(); // OPT: propagate field facts
@@ -673,6 +708,9 @@ class SsaRaNormalizer extends SsaRebuilder {
 			// OPT: remove write of zero-width field
 			// OPT: remove write of write-only field
 			return addNullCheck(oldApp, receiver);
+		} else if (raField.raFacts.RC_FLAT) {
+			// init/set of field of flattened data type
+			return map0(oldApp);
 		} else if (nf.length == 1) {
 			// common case; 1-1 field mapping
 			curBlock.opClassSetField(nf[0], receiver, newArgs[1], init);
