@@ -639,7 +639,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 		if (dn != null) {
 			var inputs = genRefs(oldApp.inputs);
 			var result = Vector<SsaInstr>.new().grow(dn.size);
-			for (t in dn.origRanges) {
+			for (t in dn.normRanges) {
 				for (i = t.0; i < t.1; i++) result.put(inputs[i]);
 			}
 			return mapN(oldApp, result.extract());
